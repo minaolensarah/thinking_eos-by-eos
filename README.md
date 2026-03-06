@@ -19,5 +19,12 @@ The folder ```src/data_generation``` contains the scripts to generate datapoints
 
 ## Citation
 If you use this code in your work, please cite the paper:
-```ToDo```
+```
+@article{breckner2026diffusionllmsthinkeosbyeos,
+      title={Diffusion LLMs can think EoS-by-EoS}, 
+      author={Sarah Breckner and Sebastian Schuster},
+      year={2026},
+      journal={arXiv preprint 2603.05197},
+      url={https://arxiv.org/abs/2603.05197}}
+```
 

@@ -1,16 +1,56 @@
 
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM 
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM #ForCausalLM
 import torch 
 import pandas as pd
-import torch
 import torch.nn as nn
 from collections import Counter
 import csv
+import random
+import sys
+
 import argparse
 
+parser = argparse.ArgumentParser(description="Select the task.")
+parser.add_argument('--task', type=str)
+parser.add_argument('--model', type=str)
+parser.add_argument('--pad_with', type=str)
+parser.add_argument('--seed', type=int, default=42)
+parser.add_argument('--name', default='')
+
+args = parser.parse_args()
+
+random.seed(args.seed)
+
+print("Running ", args.task)
 
 
-# sampling for LLaDA1.5
+def get_avg_rank(logits, token_ids, input_ids, mask):
+    """
+    Get the average rank in the logits predicted by the model of the tokens (token_ids) at the positions that are masked in the input.
+    """
+    avg = 0
+    total = 0
+    for ix, (tok_id, inputid) in enumerate(zip(token_ids, input_ids)):
+        if inputid == mask:
+            total += 1
+            logit = float(logits[ix][tok_id])
+            rank = int((logits[ix] > logit).sum()) + 1
+            avg += rank
+    return avg/total
+
+def get_hook(curr_layer, numeos, hs_corrupted):
+    """
+    Hook wrapper for patching activations at a specific layer.
+    """
+    def patch_fn(activations):
+        activations[0][:, -numeos:, :] = hs_corrupted[curr_layer+1][:,-numeos:,:]
+        return activations
+
+    def hook(module, args, output):
+        patched = patch_fn(output)
+        return patched
+    return hook
+
 def add_gumbel_noise(logits, temperature):
     '''
     The Gumbel max is a method for sampling categorical distributions.
@@ -24,7 +64,6 @@ def add_gumbel_noise(logits, temperature):
     gumbel_noise = (- torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
-# sampling for Dream-v0
 def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confidence=False, neg_entropy=False):
     """
     From logits to tokens for dream
@@ -62,205 +101,223 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
     
     return confidence, x0
     
-def main(task, modelname):
 
-    if "2.0" in modelname:
-        model = AutoModelForCausalLM.from_pretrained(modelname, trust_remote_code=True, device_map="auto")
-    else:
-        model = AutoModel.from_pretrained(modelname, trust_remote_code=True, device_map="auto")
 
-    model.tie_weights()
+if "2.0" in args.model:
+    model = AutoModelForCausalLM.from_pretrained(args.model, trust_remote_code=True, device_map="auto")
+else:
+    model = AutoModel.from_pretrained(args.model, trust_remote_code=True, device_map="auto")
 
-    tokenizer = AutoTokenizer.from_pretrained(modelname, use_fast=True, trust_remote_code=True)
+model.tie_weights()
 
-    if "1.5" in modelname:
-        tokenizer.mask_token_id = 126336
-        end_of_turn_token = "<|eot_id|>"
-    elif "dream" in modelname.lower():
-        end_of_turn_token = "<|im_end|>"
-    elif "2.0" in modelname:
-        end_of_turn_token = "<|role_end|>"
+tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True, trust_remote_code=True)
 
-    print("mask token id:", tokenizer.mask_token_id)
-    print("eos token id:", tokenizer.eos_token_id)
-    numlayers = model.config.num_hidden_layers
-    print("number of layers:", numlayers)
-    # load dataset of clean - corrputed data pairs
+if "1.5" in args.model:
+    tokenizer.mask_token_id = 126336
+    end_of_turn_token = "<|eot_id|>"
+elif "dream" in args.model.lower():
+    end_of_turn_token = "<|im_end|>"
+elif "2.0" in args.model:
+    end_of_turn_token = "<|role_end|>"
 
-    if args.task == "maths":
-        pairs1 = pd.read_json("./datasets/easy_maths_200perCalc.jsonl", orient='records', lines=True)
-        pairs2 = pairs1.copy()
-        def corrupt(calculation):
-            q = ""
-            for l in calculation:
-                if l == "-":
-                    l = "+"
-                elif l == "+":
-                    l = "-"
-                q += l
-            return q
-        pairs2["calculation"] = pairs2["calculation"].apply(corrupt)
-        sysprompt = {"role": "system", "content":"Answer the question with 'The final result is ...'. Do not give any additional explanation."}
-        for df in [pairs1, pairs2]:
-            df["sentence_id"] = df.index
-            df["prompt"] = df.apply(lambda x:  [sysprompt, {"role": "user", "content": f"What is the result of {x['calculation']}?"},
-            {"role": "assistant", "content": "The final result is " }], axis=1)
-            df["prompt"] = df["prompt"].apply(lambda m: tokenizer.apply_chat_template(m, tokenize=False).rpartition(end_of_turn_token)[0])
-        print("Example prompt: ", pairs1["prompt"].iloc[0])
-        print("Example prompt: ", pairs2["prompt"].iloc[0])
-        NUM_MASKS = 4
+print("mask token id:", tokenizer.mask_token_id)
+print("Padding token:", args.pad_with)
+numlayers = model.config.num_hidden_layers
+print("number of layers:", numlayers)
 
-    if args.task == "boxes":
-        pairs1 = pd.read_json("./datasets/boxes_testset_24X30_pair1.jsonl", orient='records', lines=True)
-        pairs2 = pd.read_json("./datasets/boxes_testset_24X30_pair2.jsonl", orient='records', lines=True)
+if args.task == "maths":
+    pairs1 = pd.read_json("datasets/easy_maths_200perCalc.jsonl", orient='records', lines=True)
+    pairs2 = pairs1.copy()
+    def corrupt(calculation):
+        q = ""
+        for l in calculation:
+            if l == "-":
+                l = "+"
+            elif l == "+":
+                l = "-"
+            q += l
+        return q
+    pairs2["calculation"] = pairs2["calculation"].apply(corrupt)
+    sysprompt = {"role": "system", "content":"Answer the question only with the number that is the final result. Do not give any additional explanation."}
+    for df in [pairs1, pairs2]:
+        df["sentence_id"] = df.index
+        df["prompt"] = df.apply(lambda x:  [sysprompt, {"role": "user", "content": f"What is the result of {x['calculation']}?"}], axis=1)
+        df["prompt"] = df["prompt"].apply(lambda m: tokenizer.apply_chat_template(m, tokenize=False))#.rpartition(end_of_turn_token)[0])
+    print("Example prompt: ", pairs1["prompt"].iloc[0])
+    print("Example prompt: ", pairs2["prompt"].iloc[0])
+    NUM_MASKS = 4
 
-        for pairs in [pairs1, pairs2]:
-            pairs["sentence_masked"] = pairs["sentence_masked"].apply(lambda s: s.replace("<extra_id_0> .", ""))
-            sysprompt = {"role": "system", "content":"Answer the question but do not give any additional explanation."}
-            pairs["prompt"] = pairs["sentence_masked"].apply(lambda sample: [sysprompt, {"role": "user", "content": sample.rpartition(".")[0] + "." + "\nWhat does Box " + sample.rpartition(".")[2].split("Box ")[1].split(" ")[0] + " contain?" },
-                    {"role": "assistant", "content": "Box " + sample.rpartition(".")[2].split("Box ")[1].split(" ")[0] + " contains " }])
-            pairs["prompt"] = pairs["prompt"].apply(lambda m: tokenizer.apply_chat_template(m, tokenize=False).rpartition(end_of_turn_token)[0])
-        print("Example prompt: ", pairs["prompt"].iloc[0])
-        NUM_MASKS = 15
+if args.task == "boxes":
+    pairs1 = pd.read_json("datasets/boxes_testset_24X30_pair1.jsonl", orient='records', lines=True)
+    pairs2 = pd.read_json("datasets/boxes_testset_24X30_pair2.jsonl", orient='records', lines=True)
+    
+    for pairs in [pairs1, pairs2]:
+        pairs["sentence_masked"] = pairs["sentence_masked"].apply(lambda s: s.replace("<extra_id_0> .", ""))
+        sysprompt = {"role": "system", "content":"Answer the question but do not give any additional explanation."}
+        pairs["prompt"] = pairs["sentence_masked"].apply(lambda sample: [sysprompt, {"role": "user", "content": sample.rpartition(".")[0] + "." + "\nWhat does Box " + sample.rpartition(".")[2].split("Box ")[1].split(" ")[0] + " contain?" }])
+        pairs["prompt"] = pairs["prompt"].apply(lambda m: tokenizer.apply_chat_template(m, tokenize=False))
+    
+    print("Example prompt: ", pairs1["prompt"].iloc[0])
+    print("Example prompt: ", pairs2["prompt"].iloc[0])
 
-    if args.task == "sudoku":
-        pairs1 = pd.read_json("./datasets/sudoku4x4_200_per_empty_cell1to12.jsonl", orient='records', lines=True)
-        backslash= "\n"
-        # leading 0s in the Sudoku are dicarded by pandas --> add back in
-        pairs1["converted_puzzle"] = pairs1["converted_puzzle"].apply(lambda x: (16-len(str(x)))*"0"+str(x))
+    NUM_MASKS = 22 
+
+if args.task == "sudoku":
+    def make_parallel_sudoku(sudoku):
+        counterfactual = ""
+        mapping = ["0", "2", "3", "4", "1"]
+        for s in sudoku:
+            counterfactual += mapping[int(s)]
+        return counterfactual 
+
+    pairs1 = pd.read_json("datasets/sudoku4x4_200_per_empty_cell1to12.jsonl", orient='records', lines=True)
+    backslash= "\n"
+    pairs1["converted_puzzle"] = pairs1["converted_puzzle"].apply(lambda x: (16-len(str(x)))*"0"+str(x))
+    
+    pairs2 = pairs1.copy()
+    pairs2["converted_puzzle"] = pairs2["converted_puzzle"].apply(make_parallel_sudoku)
+
+    for df in [pairs1, pairs2]:
         sysprompt = {"role": "system", "content": df["game_rule"].iloc[0] + "\nOnly provide the solved sudoku grid as a string of digits. Do not provide any additional explanation or text."}
-        pairs1["prompt"] = pairs1.apply(lambda x:  [sysprompt, {"role": "user", "content": f"Solve the following Sudoku puzzle:\n0000\n0040\n4312\n0200"}, {"role": "assistant", "content": f"3421\n2143\n4312\n1234"},
+        df["prompt"] = df.apply(lambda x:  [sysprompt, {"role": "user", "content": f"Solve the following Sudoku puzzle:\n0000\n0040\n4312\n0200"}, {"role": "assistant", "content": f"3421\n2143\n4312\n1234"},
                 {"role": "user", "content": f"Solve the following Sudoku puzzle:\n0400\n3014\n2300\n4032"}, {"role": "assistant", "content": f"1423\n3214\n2341\n4132"},
                 {"role": "user", "content": f"Solve the following Sudoku puzzle:\n{backslash.join([str(x['converted_puzzle'])[4*i:(4*i+4)] for i in range(4)])}"},
                 {"role": "user", "content": f"{backslash.join([str(x['converted_puzzle'])[4*i:(4*i+4)] for i in range(4)])}".replace("0", tokenizer.mask_token)}], axis=1)
-        pairs1["prompt"] = pairs1["prompt"].apply(lambda m: tokenizer.apply_chat_template(m, tokenize=False).rpartition(end_of_turn_token)[0])
-        pairs1["sentence_id"] = pairs1.index
+        df["prompt"] = df["prompt"].apply(lambda m: tokenizer.apply_chat_template(m, tokenize=False).rpartition(end_of_turn_token)[0])
+        df["sentence_id"] = df.index
 
-        # pairs2 = pairs1 shifted by one
-        pairs2 = pairs1.iloc[1:].copy()
-        pairs2.reset_index(drop=True, inplace=True)
-        pairs2.loc[len(pairs2.index)] = pairs1.iloc[0].copy()
+    print("Example corr: ", pairs1["prompt"].iloc[0])
+    print("Example clean: ", pairs2["prompt"].iloc[0])
+    NUM_MASKS = 0
 
-        pairs2["sentence_id"] = pairs2.index
-        print("Example corr: ", pairs1["prompt"].iloc[0])
-        print("Example clean: ", pairs2["prompt"].iloc[0])
-        NUM_MASKS = 0
 
-    for NUM_EOS in [8‚16, 32 ]:
-            print("eos ", NUM_EOS)
-            modelname = modelname.replace('/', '_')
-            outfile = f"../activation_patching_results/{modelname}_{args.task}_allLayers_masks{NUM_MASKS}_eos{NUM_EOS}.csv"
-            print("outfile ", outfile)
-            results = pd.DataFrame(columns=["sentence_id", "layer", "clean_input", "corrupted_input", "clean_output", "corrupted_output", "patched_output"])
+for NUM_EOS in [64 ]: #‚16, 32, 128 ]: paper with numeos 54‚
+        print("eos ", NUM_EOS)
+        modelname = args.model.replace('/', '_')
+        outfile = f"activation_patching_results/{modelname}_{args.task}{args.name}_logits_masks{NUM_MASKS}_eos{NUM_EOS}{args.pad_with}_seed{args.seed}.csv"
+        try:
+            done = pd.read_csv(outfile, sep="\t",names=["sentence_id", "layer", "clean_input", "corrupted_input", "clean_output", "corrupted_output", "patched_output", "avg_counterf_in_clean", "avg_counterf_in_patched", "avg_clean_in_patched"])
+            done_datapoints = (set(done["sentence_id"]))
+            if int(done.iloc[-1]["layer"]) < numlayers-1:
+                last_datapoint = done.iloc[-1]["sentence_id"]
+                done_datapoints.remove(last_datapoint)
+                done = done[done["sentence_id"]!= last_datapoint]
+                done.to_csv(outfile, sep="\t", index=False, header=False)
             
-            # tokenize and save index of eos tokens <- a pair should have equally many eos tokens
+            max_layer = 0
+            pairs1 = pairs1[pairs1["sentence_id"].isin(done_datapoints)==False]
+            pairs2 = pairs2[pairs2["sentence_id"].isin(done_datapoints)==False]
+            print("resuming from", len(pairs1.index))
+
+        except FileNotFoundError:
+            max_layer = 0
+        print("outfile ", outfile)
+        
+        with torch.no_grad():
             for (_, clean_row), (_, corrupted_row) in zip(pairs1.iterrows(), pairs2.iterrows()):
+                all_hooks= []
 
                 clean_tok = tokenizer(clean_row["prompt"], add_special_tokens=False)["input_ids"]
                 length_clean = len(clean_tok)
 
                 corrupted_tok = tokenizer(corrupted_row["prompt"], add_special_tokens=False)["input_ids"]
                 length_corrupt = len(corrupted_tok)
-                diff = length_clean-length_corrupt
 
-                clean_tok.extend([tokenizer.mask_token_id]*(NUM_MASKS + max(-diff, 0)) +  [tokenizer.eos_token_id]*NUM_EOS)
+                diff = length_clean-length_corrupt
+                assert length_clean == length_corrupt, "The two prompts have a different length"
+                
+                padding = []
+                if args.pad_with == "eos":
+                    padding = [tokenizer.eos_token_id] *NUM_EOS 
+                elif args.pad_with == "dots":
+                    padding = [13] *NUM_EOS 
+                elif args.pad_with == "random":
+                    if "1.5" in args.model:
+                        padding = random.choices(list(range(tokenizer.vocab_size-1)),k=NUM_EOS) 
+                    else:   
+                        padding = random.choices(list(range(tokenizer.total_vocab_size-1)),k=NUM_EOS)
+                elif args.pad_with == "whitespace":
+                    padding = [220] *NUM_EOS 
+                else:
+                    print("No valid padding specified")
+                    sys.exit()
+                
+                clean_tok.extend([tokenizer.mask_token_id]*(NUM_MASKS ) +  padding)
+
                 length_clean_with_eos = len(clean_tok)
                 clean_tok = torch.tensor(clean_tok).unsqueeze(0)
 
-                corrupted_tok.extend([tokenizer.mask_token_id]*(NUM_MASKS + max(diff, 0)) + [tokenizer.eos_token_id]*NUM_EOS)
+                corrupted_tok.extend([tokenizer.mask_token_id]*(NUM_MASKS ) + padding)
                 length_corrupt_with_eos = len(corrupted_tok)
+               
                 corrupted_tok = torch.tensor(corrupted_tok).unsqueeze(0)
 
-                # generate output logits
-                if "2.0" in modelname:
-                    position_ids = torch.arange(length_corrupt_with_eos, device="cuda").unsqueeze(0)
-                    output = model(corrupted_tok.to("cuda"), attention_mask=torch.ones(corrupted_tok.shape).to("cuda"), position_ids=position_ids, output_hidden_states=True, return_dict=True)
-                else:
-                    output = model(corrupted_tok.to("cuda"))
+                output = model(clean_tok.to("cuda"))
                 
-                # sample from logits
-                if "1.5" in modelname:
-                    logits_with_noise = add_gumbel_noise(output.logits[0], temperature=0.0)
-                    corrupted_gen = torch.argmax(logits_with_noise, dim=-1)
-                elif "dream" in modelname.lower():
-                    _ ,corrupted_gen = sample_tokens(output.logits[0])
-                elif "2.0" in modelname.lower():
-                    corrupted_gen, _ = model._sample_with_temperature_topk_topp(output.logits[0])
+                
+                if "1.5" in args.model:
+                    clean_logits = add_gumbel_noise(output.logits[0], temperature=0.0)
+                    clean_token_ids = torch.argmax(clean_logits, dim=-1)
+                elif "dream" in args.model.lower():
+                    clean_logits = output.logits[0]
+                    _ ,clean_token_ids = sample_tokens(clean_logits)
+                
+                clean_gen_decoded = tokenizer.decode(clean_token_ids)
+
+                clean_logits = clean_logits.to("cpu")
+
+                output = model(corrupted_tok.to("cuda"), output_hidden_states=True, return_dict=True)
+                if "1.5" in args.model:
+                    counterf_logits = add_gumbel_noise(output.logits[0], temperature=0.0)
+                    corrupted_token_ids = torch.argmax(counterf_logits, dim=-1)
+                elif "dream" in args.model.lower():
+                    counterf_logits = output.logits[0]
+                    _ ,corrupted_token_ids = sample_tokens(counterf_logits)
+
+                corrupted_token_ids = corrupted_token_ids.to("cpu")
+                avg_counterf_in_clean = get_avg_rank(clean_logits, corrupted_token_ids, clean_tok[0].to("cpu"), tokenizer.mask_token_id)
+                
+
+                corrupted_gen_decoded = tokenizer.decode(corrupted_token_ids)
+
+                hs_corrupted = [h[:,-NUM_EOS:,:].detach().clone() for h in output.hidden_states] 
+
+                for upuntil_layer in range(max_layer, numlayers, 2):
+                    for layer in [ upuntil_layer-1, upuntil_layer]:
+                        if layer <0:
+                            continue
+                        if "1.5" in args.model:
+                            layer_name = f"model.transformer.blocks.{layer}"
+                        elif "dream" in args.model.lower() or "2.0" in args.model:
+                            layer_name = f"model.layers.{layer}"
+                        target_layer = dict(model.named_modules()).get(layer_name, None)
+                        if target_layer is None:
+                            print(f"Layer {layer_name} not found in the model.")
+
+                        # register hook and save handle
+                        all_hooks.append(target_layer.register_forward_hook(get_hook(layer, NUM_EOS, hs_corrupted)))
                     
-                corrupted_gen = tokenizer.decode(corrupted_gen)
+                    out_patched = model(clean_tok.to("cuda"))
 
-                # save the hidden states for patching
-                hs_corrupted = output.hidden_states
-                
-                
-                for layer in range(0, numlayers, 2):
-                    if "1.5" in modelname:
-                        layer_name = f"model.transformer.blocks.{layer}"
-                    elif "dream" in modelname.lower() or "2.0" in modelname:
-                        layer_name = f"model.layers.{layer}"
-                    target_layer = dict(model.named_modules()).get(layer_name, None)
-
-                    if target_layer is None:
-                        print(f"Layer {layer_name} not found in the model.")
-
-                    # get the hidden states of the eos tokens
-                    eos_corrupted = hs_corrupted[layer][:,:-NUM_EOS,:]
-
-                    def patch_fn(activations):
-                        # replace the activations of the eos tokens
-                        activations[0][:, :-NUM_EOS, :] = eos_corrupted
-                        return activations
-
-                    def hook(module, input, output):
-                        patched = patch_fn(output)
-                        return patched
-
-                    # run an uncorrupted forward pass with the original input
-                    if "2.0" in modelname:
-                        position_ids = torch.arange(length_clean_with_eos, device="cuda").unsqueeze(0)
-                        output = model(clean_tok.to("cuda"), attention_mask=torch.ones(clean_tok.shape).to("cuda"), position_ids=position_ids)
-                    else:
-                        output = model(clean_tok.to("cuda"))
-                    if "1.5" in modelname:
-                        logits_with_noise = add_gumbel_noise(output.logits[0], temperature=0.0)
-                        clean_gen = torch.argmax(logits_with_noise, dim=-1)
-                    elif "dream" in modelname.lower():
-                        _ ,clean_gen = sample_tokens(output.logits[0])
-                    elif "2.0" in modelname.lower():
-                        clean_gen, _ = model._sample_with_temperature_topk_topp(output.logits[0])
-                    clean_gen =  tokenizer.decode(clean_gen)
-
-                    # register hook and run a patched forward pass
-                    handle = target_layer.register_forward_hook(hook)
-                    if "2.0" in modelname:
-                        position_ids = torch.arange(length_clean_with_eos, device="cuda").unsqueeze(0)
-                        out_patched = model(clean_tok.to("cuda"), attention_mask=torch.tensor(length_clean_with_eos*[1.0]).unsqueeze(0).to("cuda"), position_ids=position_ids)
-                    else:
-                        out_patched = model(clean_tok.to("cuda"))
-
-                    if "1.5" in modelname:
-                        logits_with_noise = add_gumbel_noise(out_patched.logits[0], temperature=0.0)
-                        patched_gen = torch.argmax(logits_with_noise, dim=-1)
-                    elif "dream" in modelname.lower():
+                    if "1.5" in args.model:
+                        patched_logits = add_gumbel_noise(out_patched.logits[0], temperature=0.0)
+                        patched_gen = torch.argmax(patched_logits, dim=-1)
+                    elif "dream" in args.model.lower():
                         _ ,patched_gen = sample_tokens(out_patched.logits[0])
-                    elif "2.0" in modelname.lower():
-                        patched_gen, _ = model._sample_with_temperature_topk_topp(out_patched.logits[0])
+                        patched_logits = out_patched.logits[0]
+                    
                     patched_gen = tokenizer.decode(patched_gen)
 
-                    handle.remove()
+                    patched_logits = patched_logits.to("cpu")
+                    corrupted_token_ids = corrupted_token_ids.to("cpu")
+                    avg_counterf_in_patched = get_avg_rank(patched_logits, corrupted_token_ids, clean_tok[0], tokenizer.mask_token_id)
+                    avg_clean_in_patched = get_avg_rank(patched_logits, clean_token_ids, clean_tok[0], tokenizer.mask_token_id)
 
-                    # write results to file
                     with open(outfile, "a", newline='') as f:
                         tsvwriter = csv.writer(f, delimiter='\t')
-                        tsvwriter.writerow([clean_row["sentence_id"], layer, tokenizer.decode(clean_tok[0]), tokenizer.decode(corrupted_tok[0]), clean_gen, corrupted_gen, patched_gen])
+                        tsvwriter.writerow([clean_row["sentence_id"], layer, tokenizer.decode(clean_tok[0]), tokenizer.decode(corrupted_tok[0]), clean_gen_decoded, corrupted_gen_decoded, patched_gen, avg_counterf_in_clean, avg_counterf_in_patched, avg_clean_in_patched])
                     
-
-
-if __name__=="__main__":
-    parser = argparse.ArgumentParser(description="Select the task and the model.")
-    parser.add_argument('--task', choices=['maths', 'boxes', 'sudoku'], type=str)
-    parser.add_argument('--model', type=str)
-    args = parser.parse_args()
-
-    print("Running ", args.task)
-    main(args.task, args.model)
+                max_layer = 0
+                for handle in all_hooks:
+                    handle.remove()
+                

@@ -1,6 +1,6 @@
 # Diffusion LLMs can think eos-by-eos 
 
-This repository contains code and datasets to reproduce the experiments from the paper "Masked diffusion LLMs can use EoS tokens for hidden reasoning". 
+This repository contains code and datasets to reproduce the experiments from the paper [Masked diffusion LLMs can use EoS tokens for hidden reasoning](https://arxiv.org/abs/2603.05197). 
 <img src="figure1.png" alt="Illustration of Diffusion LLMs can think eos-by-eos" />
 
 
@@ -21,5 +21,13 @@ The folder ```src/data_generation``` contains the scripts to generate datapoints
 ## Citation
 If you use this code in your work, please cite the paper:
 ```
-todo
+@misc{breckner2026maskeddiffusionllmsuse,
+      title={Masked diffusion LLMs can use EoS tokens for hidden reasoning}, 
+      author={Sarah Breckner and Sebastian Schuster},
+      year={2026},
+      eprint={2603.05197},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2603.05197}, 
+}
 ```
